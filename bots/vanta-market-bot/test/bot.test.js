@@ -8,14 +8,12 @@ const {
   finalizeTicketClosure,
   finishTicketRow,
   orderApprovalButtons,
-  paymentCurrencyRow,
   prepareTicketClosure,
   rejectOrder,
-  reviewPaymentProof,
   storeButtons,
 } = require('../index');
 
-function makeOrder(db, status = 'awaiting_payment') {
+function makeOrder(db, status = 'open') {
   const now = Date.now();
   const result = db.prepare(`
     INSERT INTO orders (
@@ -46,16 +44,6 @@ function makePurchaseTicket(db, orderId, status = 'open') {
   return Number(result.lastInsertRowid);
 }
 
-function makeProof(db, orderId) {
-  const result = db.prepare(`
-    INSERT INTO payment_proofs (
-      order_id, message_id, submitted_by, transaction_reference,
-      attachment_urls, status, created_at
-    ) VALUES (?, ?, 'customer-1', ?, '[]', 'submitted', ?)
-  `).run(orderId, `message-${orderId}`, 'a'.repeat(64), Date.now());
-  return Number(result.lastInsertRowid);
-}
-
 test('SQLite schema enforces one open support ticket per customer', () => {
   const db = createDatabase(':memory:');
   try {
@@ -82,7 +70,7 @@ test('SQLite schema enforces one open support ticket per customer', () => {
   }
 });
 
-test('staff rejection and payment confirmation are conditional and idempotent', () => {
+test('order rejection is conditional and idempotent', () => {
   const db = createDatabase(':memory:');
   try {
     const pendingOrderId = makeOrder(db, 'pending_approval');
@@ -90,75 +78,48 @@ test('staff rejection and payment confirmation are conditional and idempotent', 
     assert.equal(rejectOrder(db, pendingOrderId, 'guild-1'), false);
     assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(pendingOrderId).status, 'rejected');
 
-    const orderId = makeOrder(db, 'proof_submitted');
-    makePurchaseTicket(db, orderId);
-    const proofId = makeProof(db, orderId);
-    const result = reviewPaymentProof(db, proofId, 'guild-1', 'staff-1', 'confirm');
-    assert.equal(result.error, undefined);
-    assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId).status, 'paid');
-    assert.equal(db.prepare('SELECT status FROM payment_proofs WHERE id = ?').get(proofId).status, 'confirmed');
-    assert.equal(reviewPaymentProof(db, proofId, 'guild-1', 'staff-2', 'confirm').error, 'processed');
   } finally {
     db.close();
   }
 });
 
-test('closing an unpaid ticket never marks its order as paid', () => {
+test('closing a purchase ticket closes its order without recording payment', () => {
   const db = createDatabase(':memory:');
   try {
-    const orderId = makeOrder(db, 'awaiting_payment');
+    const orderId = makeOrder(db, 'open');
     const ticketId = makePurchaseTicket(db, orderId);
     const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
 
     assert.equal(prepareTicketClosure(db, ticket), true);
     assert.equal(prepareTicketClosure(db, ticket), false);
     assert.equal(finalizeTicketClosure(db, ticketId).status, 'closed');
-    assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId).status, 'closed_unpaid');
+    assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId).status, 'closed');
   } finally {
     db.close();
   }
 });
 
-test('proof rejection returns an open order to payment without verifying it', () => {
+test('new shop workflow has no wallet or payment-proof storage', () => {
   const db = createDatabase(':memory:');
   try {
-    const orderId = makeOrder(db, 'proof_submitted');
-    makePurchaseTicket(db, orderId, 'open');
-    const proofId = makeProof(db, orderId);
-    reviewPaymentProof(db, proofId, 'guild-1', 'staff-1', 'reject');
-
-    assert.equal(db.prepare('SELECT status FROM payment_proofs WHERE id = ?').get(proofId).status, 'rejected');
-    assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId).status, 'awaiting_payment');
+    const columns = db.prepare('PRAGMA table_info(orders)').all().map((column) => column.name);
+    assert.equal(columns.includes('payment_currency'), false);
+    assert.equal(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'payment_proofs'").get(),
+      undefined,
+    );
+    assert.deepEqual(
+      db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'orders'").get().sql.match(/'[^']+'/g),
+      ["'pending_approval'", "'ticket_creating'", "'open'", "'rejected'", "'closed'"],
+    );
   } finally {
     db.close();
   }
 });
 
-test('staff can confirm a submitted proof after the customer closes the unpaid ticket', () => {
-  const db = createDatabase(':memory:');
-  try {
-    const orderId = makeOrder(db, 'proof_submitted');
-    const ticketId = makePurchaseTicket(db, orderId);
-    const proofId = makeProof(db, orderId);
-    const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
-
-    prepareTicketClosure(db, ticket);
-    finalizeTicketClosure(db, ticketId);
-    assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId).status, 'closed_unpaid');
-
-    const result = reviewPaymentProof(db, proofId, 'guild-1', 'staff-1', 'confirm');
-    assert.equal(result.error, undefined);
-    assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId).status, 'paid');
-    assert.equal(db.prepare('SELECT status FROM tickets WHERE id = ?').get(ticketId).status, 'closed');
-  } finally {
-    db.close();
-  }
-});
-
-test('all persistent component IDs have matching handler prefixes', () => {
+test('all persistent component IDs match the active handlers', () => {
   const storeIds = storeButtons().components.map((component) => component.data.custom_id);
   const approvalIds = orderApprovalButtons(42).components.map((component) => component.data.custom_id);
-  const paymentIds = paymentCurrencyRow(42).components.map((component) => component.data.custom_id);
   const finishId = finishTicketRow().components[0].data.custom_id;
 
   assert.deepEqual(storeIds, [
@@ -167,7 +128,6 @@ test('all persistent component IDs have matching handler prefixes', () => {
     COMPONENT_IDS.support,
   ]);
   assert.deepEqual(approvalIds, ['order:accept:42', 'order:reject:42']);
-  assert.deepEqual(paymentIds, ['pay:42:LTC', 'pay:42:BTC', 'pay:42:USDT']);
   assert.equal(finishId, COMPONENT_IDS.finishTicket);
-  for (const id of [...approvalIds, ...paymentIds]) assert.ok(id.length <= 100);
+  for (const id of [...storeIds, ...approvalIds, finishId]) assert.ok(id.length <= 100);
 });

@@ -35,14 +35,7 @@ const PRODUCTS = Object.freeze({
   },
 });
 
-const CURRENCIES = Object.freeze({
-  LTC: 'Litecoin (LTC)',
-  BTC: 'Bitcoin (BTC)',
-  USDT: 'USDT',
-});
-
 const SNOWFLAKE = /^\d{17,20}$/;
-const TX_REFERENCE = /(?:0x)?[a-fA-F0-9]{32,128}|[1-9A-HJ-NP-Za-km-z]{32,128}/;
 const TICKET_LEASE_MS = 2 * 60 * 1000;
 const OPEN_TICKET_STATUSES = ['creating', 'open', 'closing'];
 const COMPONENT_IDS = Object.freeze({
@@ -66,12 +59,6 @@ function loadConfig() {
     staffRoleId: requiredEnv('STAFF_ROLE_ID'),
     ordersChannelId: requiredEnv('ORDERS_CHANNEL_ID'),
     ticketCategoryId: requiredEnv('TICKET_CATEGORY_ID'),
-    wallets: {
-      LTC: requiredEnv('LTC_WALLET'),
-      BTC: requiredEnv('BTC_WALLET'),
-      USDT: requiredEnv('USDT_WALLET'),
-    },
-    usdtNetwork: requiredEnv('USDT_NETWORK'),
     databasePath: process.env.DATABASE_PATH?.trim() || path.join('data', 'vanta-market.sqlite'),
   };
 
@@ -85,9 +72,6 @@ function loadConfig() {
     if (!SNOWFLAKE.test(value)) throw new Error(`${name} يجب أن يكون Discord ID صالحًا.`);
   }
 
-  if (config.usdtNetwork.length > 40) {
-    throw new Error('USDT_NETWORK يجب ألا يتجاوز 40 حرفًا.');
-  }
   if (config.token.length < 20) throw new Error('DISCORD_TOKEN غير صالح أو غير مكتمل.');
 
   return config;
@@ -101,6 +85,57 @@ function createDatabase(databasePath = process.env.DATABASE_PATH?.trim() || path
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
+
+  const existingOrders = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'orders'",
+  ).get();
+  if (existingOrders?.sql?.includes('awaiting_payment')) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE orders_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        interaction_id TEXT NOT NULL UNIQUE,
+        guild_id TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        product_key TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        price_cents INTEGER NOT NULL CHECK (price_cents > 0),
+        status TEXT NOT NULL CHECK (status IN (
+          'pending_approval', 'ticket_creating', 'open', 'rejected', 'closed'
+        )),
+        staff_message_id TEXT UNIQUE,
+        ticket_channel_id TEXT UNIQUE,
+        ticket_channel_name TEXT,
+        ticket_creation_started_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO orders_rebuilt (
+        id, interaction_id, guild_id, customer_id, product_key, product_name,
+        price_cents, status, staff_message_id, ticket_channel_id,
+        ticket_channel_name, ticket_creation_started_at, created_at, updated_at
+      )
+      SELECT o.id, o.interaction_id, o.guild_id, o.customer_id, o.product_key,
+        o.product_name, o.price_cents,
+        CASE
+          WHEN o.status IN ('pending_approval', 'ticket_creating', 'rejected') THEN o.status
+          WHEN o.status = 'closed_unpaid' THEN 'closed'
+          WHEN EXISTS (
+            SELECT 1 FROM tickets t WHERE t.order_id = o.id AND t.status = 'closed'
+          ) THEN 'closed'
+          ELSE 'open'
+        END,
+        o.staff_message_id, o.ticket_channel_id, o.ticket_channel_name,
+        o.ticket_creation_started_at, o.created_at, o.updated_at
+      FROM orders o;
+      DROP TABLE orders;
+      ALTER TABLE orders_rebuilt RENAME TO orders;
+      COMMIT;
+    `);
+    db.pragma('foreign_keys = ON');
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,14 +146,12 @@ function createDatabase(databasePath = process.env.DATABASE_PATH?.trim() || path
       product_name TEXT NOT NULL,
       price_cents INTEGER NOT NULL CHECK (price_cents > 0),
       status TEXT NOT NULL CHECK (status IN (
-        'pending_approval', 'ticket_creating', 'awaiting_payment',
-        'proof_submitted', 'paid', 'rejected', 'closed_unpaid'
+        'pending_approval', 'ticket_creating', 'open', 'rejected', 'closed'
       )),
       staff_message_id TEXT UNIQUE,
       ticket_channel_id TEXT UNIQUE,
       ticket_channel_name TEXT,
       ticket_creation_started_at INTEGER,
-      payment_currency TEXT CHECK (payment_currency IN ('LTC', 'BTC', 'USDT') OR payment_currency IS NULL),
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -141,21 +174,6 @@ function createDatabase(databasePath = process.env.DATABASE_PATH?.trim() || path
       ON tickets(guild_id, customer_id)
       WHERE kind = 'support' AND status IN ('creating', 'open', 'closing');
 
-    CREATE TABLE IF NOT EXISTS payment_proofs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id INTEGER NOT NULL REFERENCES orders(id),
-      message_id TEXT NOT NULL UNIQUE,
-      submitted_by TEXT NOT NULL,
-      transaction_reference TEXT,
-      attachment_urls TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('submitted', 'confirmed', 'rejected', 'superseded')),
-      reviewed_by TEXT,
-      created_at INTEGER NOT NULL,
-      reviewed_at INTEGER
-    );
-
-    CREATE INDEX IF NOT EXISTS proofs_by_order_status
-      ON payment_proofs(order_id, status);
     CREATE INDEX IF NOT EXISTS tickets_by_channel_status
       ON tickets(channel_id, status);
     CREATE INDEX IF NOT EXISTS orders_by_status_created
@@ -173,15 +191,15 @@ function createStoreEmbed() {
     .setColor(0x7546ff)
     .setTitle('Vanta Market | المتجر')
     .setDescription([
-      'اختر المنتج لبدء طلبك. ستتم مراجعة الطلب من فريق المتجر قبل فتح تذكرة الدفع.',
+      'اختر المنتج لإرسال طلبك إلى فريق المتجر. تفتح تذكرة خاصة بعد موافقة الموظف.',
       '',
       `**Minecraft Java + Bedrock** — ${money(PRODUCTS.minecraft.priceCents)}`,
       `**خدمة رقمية مرخّصة** — ${money(PRODUCTS.digital_service.priceCents)}`,
       '',
-      'بعد قبول الطلب، ستظهر لك خيارات الدفع داخل تذكرة خاصة.',
+      'ناقش تفاصيل الطلب والدفع مباشرة مع الموظف داخل التذكرة.',
     ].join('\n'))
     .setThumbnail('attachment://vanta-market-logo.png')
-    .setFooter({ text: 'لا ترسل أبدًا عبارة الاسترداد أو المفتاح الخاص لأي شخص.' });
+    .setFooter({ text: 'لا ترسل كلمات مرور أو مفاتيح خاصة أو عبارات استرداد.' });
 }
 
 function storeButtons() {
@@ -238,23 +256,6 @@ function finishTicketRow() {
   );
 }
 
-function paymentCurrencyRow(orderId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`pay:${orderId}:LTC`)
-      .setLabel('Litecoin (LTC)')
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(`pay:${orderId}:BTC`)
-      .setLabel('Bitcoin (BTC)')
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(`pay:${orderId}:USDT`)
-      .setLabel('USDT')
-      .setStyle(ButtonStyle.Primary),
-  );
-}
-
 function ticketIntroEmbed(ticket, order = null) {
   if (ticket.kind === 'support') {
     return new EmbedBuilder()
@@ -269,29 +270,16 @@ function ticketIntroEmbed(ticket, order = null) {
 
   return new EmbedBuilder()
     .setColor(0x7546ff)
-    .setTitle(`تذكرة شراء #${order.id}`)
+    .setTitle(`تذكرة طلب #${order.id}`)
     .setDescription([
       `**المنتج:** ${order.product_name}`,
       `**رقم الطلب:** #${order.id}`,
       `**المبلغ المطلوب:** ${money(order.price_cents)}`,
       '',
-      'اختر عملة الدفع لعرض عنوان الاستلام والشبكة الصحيحة.',
-      '**تحذير:** تحقّق من الشبكة والعنوان قبل الإرسال، وأكّد المبلغ مع الموظفين.',
-      'لا ترسل أبدًا مفتاحًا خاصًا أو عبارة استرداد. لا يتم اعتماد الدفع من صورة وحدها؛ يتحقق الموظف من المعاملة على الشبكة.',
+      'تحدث مع الموظف هنا للاتفاق على تفاصيل الطلب وطريقة الدفع.',
+      'البوت لا يستقبل التحويلات ولا يتابعها أو يتحقق منها؛ نسّق الدفع مباشرة مع الموظف.',
+      'لا ترسل كلمات مرور أو مفاتيح خاصة أو عبارات استرداد.',
     ].join('\n'));
-}
-
-function proofReviewRow(proofId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`proof:confirm:${proofId}`)
-      .setLabel('تأكيد الدفع بعد التحقق')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`proof:reject:${proofId}`)
-      .setLabel('رفض الإثبات')
-      .setStyle(ButtonStyle.Danger),
-  );
 }
 
 function parsePositiveInteger(value) {
@@ -375,15 +363,11 @@ async function ensureTicketPrompt(db, ticket, guild, config) {
   if (promptExists) return;
 
   const order = ticket.order_id ? db.prepare('SELECT * FROM orders WHERE id = ?').get(ticket.order_id) : null;
-  const rows = [finishTicketRow()];
-  if (ticket.kind === 'purchase' && order && order.status !== 'paid' && order.status !== 'rejected') {
-    rows.unshift(paymentCurrencyRow(order.id));
-  }
   await channel.send({
     content: ticket.kind === 'support' ? `<@&${config.staffRoleId}>` : undefined,
     allowedMentions: ticket.kind === 'support' ? { roles: [config.staffRoleId] } : undefined,
     embeds: [ticketIntroEmbed(ticket, order)],
-    components: rows,
+    components: [finishTicketRow()],
   });
 }
 
@@ -391,8 +375,6 @@ function createClient() {
   return new Client({
     intents: [
       GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
     ],
   });
 }
@@ -617,7 +599,7 @@ async function acceptOrder(db, interaction, orderId, guild, config) {
         `).run(channel.id, ticket.id);
       }
       db.prepare(`
-        UPDATE orders SET status = 'awaiting_payment', ticket_channel_id = ?,
+        UPDATE orders SET status = 'open', ticket_channel_id = ?,
           ticket_creation_started_at = NULL, updated_at = ?
         WHERE id = ? AND status = 'ticket_creating'
       `).run(channel.id, Date.now(), order.id);
@@ -629,7 +611,7 @@ async function acceptOrder(db, interaction, orderId, guild, config) {
     await interaction.editReply(`تم قبول الطلب وفتح تذكرة خاصة: <#${channel.id}>`);
     const customer = await guild.client.users.fetch(order.customer_id).catch(() => null);
     if (customer) {
-      await customer.send(`تم قبول طلبك **#${order.id}**. أكمل خطوات الدفع في التذكرة: <#${channel.id}>`)
+      await customer.send(`تم قبول طلبك **#${order.id}**. تابع النقاش مع الموظف في التذكرة: <#${channel.id}>`)
         .catch(() => {});
     }
     return savedOrder;
@@ -653,127 +635,6 @@ function rejectOrder(db, orderId, guildId) {
   return result.changes === 1;
 }
 
-async function choosePaymentCurrency(db, interaction, orderId, currency, config) {
-  if (!Object.hasOwn(CURRENCIES, currency)) {
-    await interaction.reply({ content: 'عملة الدفع غير معروفة.', ephemeral: true });
-    return;
-  }
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
-  const ticket = db.prepare(`
-    SELECT * FROM tickets WHERE order_id = ? AND channel_id = ? AND status = 'open'
-  `).get(orderId, interaction.channelId);
-  if (!order || !ticket || order.guild_id !== interaction.guildId ||
-      order.customer_id !== interaction.user.id) {
-    await interaction.reply({ content: 'هذا الخيار متاح لصاحب الطلب داخل تذكرته المفتوحة فقط.', ephemeral: true });
-    return;
-  }
-  if (!['awaiting_payment', 'proof_submitted'].includes(order.status)) {
-    await interaction.reply({ content: 'لا يمكن تغيير عملة هذا الطلب في حالته الحالية.', ephemeral: true });
-    return;
-  }
-
-  db.prepare(`
-    UPDATE orders SET payment_currency = ?, updated_at = ?
-    WHERE id = ? AND customer_id = ? AND status IN ('awaiting_payment', 'proof_submitted')
-  `).run(currency, Date.now(), orderId, interaction.user.id);
-
-  const network = currency === 'USDT' ? `\n**الشبكة:** ${config.usdtNetwork}` : '';
-  const embed = new EmbedBuilder()
-    .setColor(0x7546ff)
-    .setTitle(`تعليمات الدفع — ${CURRENCIES[currency]}`)
-    .setDescription([
-      `**المبلغ المطلوب:** ${money(order.price_cents)}`,
-      `**عنوان الاستلام:**\n\`${config.wallets[currency]}\`${network}`,
-      '',
-      'تحقّق من العملة والشبكة والعنوان قبل الإرسال. تأكّد من المبلغ والرسوم مع الموظفين.',
-      'بعد الإرسال، أرسل معرّف المعاملة أو أرفق إثباتًا في هذه التذكرة. الصورة وحدها لا تؤكد الدفع.',
-      'لا ترسل أبدًا مفتاحًا خاصًا أو عبارة استرداد.',
-    ].join('\n'));
-
-  await interaction.reply({ embeds: [embed], ephemeral: true });
-}
-
-function saveProof(db, order, message, transactionReference, attachmentUrls) {
-  return withTransaction(db, () => {
-    const freshOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
-    if (!freshOrder || !['awaiting_payment', 'proof_submitted'].includes(freshOrder.status)) {
-      return null;
-    }
-    const result = db.prepare(`
-      INSERT OR IGNORE INTO payment_proofs (
-        order_id, message_id, submitted_by, transaction_reference,
-        attachment_urls, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, 'submitted', ?)
-    `).run(
-      order.id,
-      message.id,
-      message.author.id,
-      transactionReference,
-      JSON.stringify(attachmentUrls),
-      Date.now(),
-    );
-    if (result.changes !== 1) return null;
-
-    db.prepare(`
-      UPDATE orders SET status = 'proof_submitted', updated_at = ?
-      WHERE id = ? AND status = 'awaiting_payment'
-    `).run(Date.now(), order.id);
-    return db.prepare('SELECT * FROM payment_proofs WHERE id = ?')
-      .get(Number(result.lastInsertRowid));
-  });
-}
-
-function reviewPaymentProof(db, proofId, guildId, reviewerId, action) {
-  return withTransaction(db, () => {
-    const proof = db.prepare(`
-      SELECT p.*, o.guild_id, o.status AS order_status, o.customer_id,
-        o.ticket_channel_id
-      FROM payment_proofs p
-      JOIN orders o ON o.id = p.order_id
-      WHERE p.id = ?
-    `).get(proofId);
-    if (!proof || proof.guild_id !== guildId) return { error: 'not_found' };
-    if (proof.status !== 'submitted') return { error: 'processed' };
-
-    const allowedOrderStatuses = action === 'confirm'
-      ? ['proof_submitted', 'closed_unpaid']
-      : ['proof_submitted', 'closed_unpaid'];
-    if (!allowedOrderStatuses.includes(proof.order_status)) return { error: 'processed' };
-
-    const updated = db.prepare(`
-      UPDATE payment_proofs SET status = ?, reviewed_by = ?, reviewed_at = ?
-      WHERE id = ? AND status = 'submitted'
-    `).run(action === 'confirm' ? 'confirmed' : 'rejected', reviewerId, Date.now(), proofId);
-    if (updated.changes !== 1) return { error: 'processed' };
-
-    if (action === 'confirm') {
-      db.prepare(`
-        UPDATE orders SET status = 'paid', updated_at = ?
-        WHERE id = ? AND status IN ('proof_submitted', 'closed_unpaid')
-      `).run(Date.now(), proof.order_id);
-      db.prepare(`
-        UPDATE payment_proofs SET status = 'superseded', reviewed_by = ?, reviewed_at = ?
-        WHERE order_id = ? AND status = 'submitted' AND id != ?
-      `).run(reviewerId, Date.now(), proof.order_id, proofId);
-      return { proof, newOrderStatus: 'paid' };
-    }
-
-    const remaining = db.prepare(`
-      SELECT COUNT(*) AS count FROM payment_proofs
-      WHERE order_id = ? AND status = 'submitted'
-    `).get(proof.order_id).count;
-    if (remaining === 0) {
-      const ticket = db.prepare('SELECT status FROM tickets WHERE order_id = ?').get(proof.order_id);
-      const nextStatus = ticket?.status === 'closed' ? 'closed_unpaid' : 'awaiting_payment';
-      db.prepare(`
-        UPDATE orders SET status = ?, updated_at = ?
-        WHERE id = ? AND status IN ('proof_submitted', 'closed_unpaid')
-      `).run(nextStatus, Date.now(), proof.order_id);
-    }
-    return { proof, newOrderStatus: remaining > 0 ? 'proof_submitted' : 'awaiting_payment' };
-  });
-}
-
 function prepareTicketClosure(db, ticket) {
   const result = db.prepare(`
     UPDATE tickets SET status = 'closing'
@@ -793,8 +654,8 @@ function finalizeTicketClosure(db, ticketId) {
     if (updated.changes !== 1) return null;
     if (ticket.kind === 'purchase') {
       db.prepare(`
-        UPDATE orders SET status = 'closed_unpaid', updated_at = ?
-        WHERE id = ? AND status IN ('awaiting_payment', 'proof_submitted')
+        UPDATE orders SET status = 'closed', updated_at = ?
+        WHERE id = ? AND status = 'open'
       `).run(Date.now(), ticket.order_id);
     }
     return db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
@@ -858,109 +719,6 @@ async function closeTicket(db, interaction, guild) {
   }
 }
 
-async function handleProofSubmission(db, message, config) {
-  if (message.author.bot || message.guildId !== config.guildId) return;
-  const ticket = db.prepare(`
-    SELECT * FROM tickets
-    WHERE channel_id = ? AND kind = 'purchase' AND status = 'open'
-  `).get(message.channelId);
-  if (!ticket || ticket.customer_id !== message.author.id) return;
-
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(ticket.order_id);
-  if (!order || !['awaiting_payment', 'proof_submitted'].includes(order.status)) return;
-
-  const text = message.content.trim();
-  const referenceMatch = text.match(TX_REFERENCE);
-  const transactionReference = referenceMatch?.[0] || null;
-  const attachments = [...message.attachments.values()];
-  if (!transactionReference && attachments.length === 0) {
-    if (text.length >= 8) {
-      await message.reply('لإرسال إثبات دفع، أرسل معرّف المعاملة أو أرفق صورة/ملف للإثبات. لن يتم اعتماد الصورة تلقائيًا.')
-        .catch(() => {});
-    }
-    return;
-  }
-  if (!order.payment_currency) {
-    await message.reply('اختر عملة الدفع من الأزرار أولًا حتى يتمكن الموظفون من التحقق من الشبكة الصحيحة.')
-      .catch(() => {});
-    return;
-  }
-
-  const proof = saveProof(
-    db,
-    order,
-    message,
-    transactionReference,
-    attachments.slice(0, 5).map((attachment) => attachment.url),
-  );
-  if (!proof) return;
-
-  const proofEmbed = new EmbedBuilder()
-    .setColor(0xf0b232)
-    .setTitle(`إثبات دفع بانتظار المراجعة — الطلب #${order.id}`)
-    .setDescription([
-      `**العميل:** <@${message.author.id}>`,
-      `**العملة المختارة:** ${order.payment_currency || 'لم تُحدد'}`,
-      `**مرجع المعاملة:** ${transactionReference ? `\`${transactionReference}\`` : 'أُرفق ملف إثبات'}`,
-      `[فتح رسالة العميل](${message.url})`,
-      '',
-      'لا تؤكدوا الدفع اعتمادًا على صورة فقط. تحقّقوا بأنفسكم من المعاملة على الشبكة الصحيحة ومن المبلغ المستلم.',
-    ].join('\n'));
-
-  await message.channel.send({
-    content: `<@&${config.staffRoleId}>`,
-    allowedMentions: { roles: [config.staffRoleId] },
-    embeds: [proofEmbed],
-    components: [proofReviewRow(proof.id)],
-  });
-}
-
-async function handleProofReview(db, interaction, proofId, action, guild) {
-  if (!hasStaffRole(interaction.member, interaction.client.config.staffRoleId)) {
-    await interaction.reply({ content: 'هذا الإجراء متاح للموظفين المصرّح لهم فقط.', ephemeral: true });
-    return;
-  }
-
-  const result = reviewPaymentProof(db, proofId, guild.id, interaction.user.id, action);
-  if (result.error) {
-    await interaction.reply({
-      content: result.error === 'not_found'
-        ? 'تعذر العثور على إثبات الدفع لهذا السيرفر.'
-        : 'تمت معالجة هذا الإثبات أو تغيير حالة الطلب مسبقًا.',
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const statusText = action === 'confirm'
-    ? 'تم تسجيل تأكيد الموظف بعد التحقق المستقل من المعاملة. لا يتم تسليم المنتج تلقائيًا.'
-    : 'رُفض هذا الإثبات. أرسل معرّف المعاملة الصحيح أو تواصل مع الموظفين.';
-  await interaction.update({
-    embeds: [EmbedBuilder.from(interaction.message.embeds[0]).setFooter({ text: `عولج بواسطة ${interaction.user.tag}` })],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`proof:${action}:${proofId}`)
-        .setLabel(action === 'confirm' ? 'تم التحقق من الدفع' : 'تم رفض الإثبات')
-        .setStyle(action === 'confirm' ? ButtonStyle.Success : ButtonStyle.Danger)
-        .setDisabled(true),
-    )],
-  });
-
-  const customer = await interaction.client.users.fetch(result.proof.submitted_by).catch(() => null);
-  if (customer) {
-    await customer.send(`تحديث الطلب **#${result.proof.order_id}**: ${statusText}`)
-      .catch(() => {});
-  }
-  if (action === 'confirm') {
-    const ticketChannel = result.proof.ticket_channel_id
-      ? await guild.channels.fetch(result.proof.ticket_channel_id).catch(() => null)
-      : null;
-    if (ticketChannel?.type === ChannelType.GuildText) {
-      await ticketChannel.send(`تم تسجيل تأكيد الدفع يدويًا للطلب #${result.proof.order_id}. لا يتم تسليم المنتجات تلقائيًا.`);
-    }
-  }
-}
-
 async function reconcileTickets(db, guild, config) {
   const stale = db.prepare(`
     SELECT * FROM tickets
@@ -992,7 +750,7 @@ async function reconcileTickets(db, guild, config) {
           .run(channel.id, ticket.id);
         if (ticket.kind === 'purchase') {
           db.prepare(`
-            UPDATE orders SET status = 'awaiting_payment', ticket_channel_id = ?,
+            UPDATE orders SET status = 'open', ticket_channel_id = ?,
               ticket_creation_started_at = NULL, updated_at = ?
             WHERE id = ? AND status = 'ticket_creating'
           `).run(channel.id, Date.now(), ticket.order_id);
@@ -1161,7 +919,7 @@ async function start() {
           const previousStatus = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId)?.status;
           await acceptOrder(db, interaction, orderId, interaction.guild, config);
           const updatedStatus = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId)?.status;
-          if (updatedStatus && ['awaiting_payment', 'proof_submitted', 'paid'].includes(updatedStatus)) {
+          if (updatedStatus === 'open') {
             await interaction.message.edit({ components: [orderApprovalButtons(orderId, true)] }).catch(() => {});
           } else if (previousStatus === 'pending_approval' && updatedStatus === 'ticket_creating') {
             // Keep the approval buttons available so staff can retry after a transient Discord failure.
@@ -1181,42 +939,13 @@ async function start() {
         return;
       }
 
-      const paymentMatch = id.match(/^pay:(\d+):(LTC|BTC|USDT)$/);
-      if (paymentMatch) {
-        const orderId = parsePositiveInteger(paymentMatch[1]);
-        if (!orderId) {
-          await interaction.reply({ content: 'رقم الطلب غير صالح.', ephemeral: true });
-          return;
-        }
-        await choosePaymentCurrency(db, interaction, orderId, paymentMatch[2], config);
-        return;
-      }
-
-      const proofMatch = id.match(/^proof:(confirm|reject):(\d+)$/);
-      if (proofMatch) {
-        const proofId = parsePositiveInteger(proofMatch[2]);
-        if (!proofId) {
-          await interaction.reply({ content: 'رقم الإثبات غير صالح.', ephemeral: true });
-          return;
-        }
-        await handleProofReview(db, interaction, proofId, proofMatch[1], interaction.guild);
-      }
     } catch (error) {
       console.error('خطأ أثناء معالجة تفاعل Discord:', error.message);
       if (interaction.isRepliable()) {
-        const message = 'تعذر إكمال الإجراء الآن. لم يُفترض تأكيد أي دفعة تلقائيًا؛ تحقق من حالة الطلب قبل إعادة المحاولة.';
+        const message = 'تعذر إكمال الإجراء الآن. تحقق من حالة الطلب أو التذكرة قبل إعادة المحاولة.';
         if (interaction.deferred) await interaction.editReply(message).catch(() => {});
         else if (!interaction.replied) await interaction.reply({ content: message, ephemeral: true }).catch(() => {});
       }
-    }
-  });
-
-  client.on(Events.MessageCreate, async (message) => {
-    try {
-      await handleProofSubmission(db, message, config);
-    } catch (error) {
-      console.error('تعذر حفظ إثبات الدفع:', error.message);
-      await message.reply('تعذر تسجيل الإثبات الآن. أبلغ الموظفين قبل إعادة إرساله.').catch(() => {});
     }
   });
 
@@ -1244,16 +973,13 @@ if (require.main === module) {
 
 module.exports = {
   COMPONENT_IDS,
-  CURRENCIES,
   PRODUCTS,
   createDatabase,
   finalizeTicketClosure,
   orderApprovalButtons,
-  paymentCurrencyRow,
   prepareTicketClosure,
   loadConfig,
   rejectOrder,
-  reviewPaymentProof,
   storeButtons,
   finishTicketRow,
 };
