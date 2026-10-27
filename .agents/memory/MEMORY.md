@@ -1,0 +1,1 @@
+- [Standalone npm lockfiles](standalone-npm-lockfiles.md) — Generate npm locks outside the pnpm tree when nested dependencies are symlinked.

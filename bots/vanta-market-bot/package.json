@@ -1,0 +1,21 @@
+{
+  "name": "@workspace/vanta-market-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Arabic Discord shop and private ticket bot for Vanta Market",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.6.1"
+  }
+}
