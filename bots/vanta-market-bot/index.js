@@ -274,7 +274,7 @@ function ticketIntroEmbed(ticket, order = null) {
     .setDescription([
       `**المنتج:** ${order.product_name}`,
       `**رقم الطلب:** #${order.id}`,
-      `**المبلغ المطلوب:** ${money(order.price_cents)}`,
+      `**السعر:** ${money(order.price_cents)}`,
       '',
       'تحدث مع الموظف هنا للاتفاق على تفاصيل الطلب وطريقة الدفع.',
       'البوت لا يستقبل التحويلات ولا يتابعها أو يتحقق منها؛ نسّق الدفع مباشرة مع الموظف.',

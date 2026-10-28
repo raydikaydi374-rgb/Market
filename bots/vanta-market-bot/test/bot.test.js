@@ -1,7 +1,11 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
+const Database = require('better-sqlite3');
 const {
   COMPONENT_IDS,
   createDatabase,
@@ -77,9 +81,94 @@ test('order rejection is conditional and idempotent', () => {
     assert.equal(rejectOrder(db, pendingOrderId, 'guild-1'), true);
     assert.equal(rejectOrder(db, pendingOrderId, 'guild-1'), false);
     assert.equal(db.prepare('SELECT status FROM orders WHERE id = ?').get(pendingOrderId).status, 'rejected');
-
   } finally {
     db.close();
+  }
+});
+
+test('legacy database orders migrate to discussion and closed states without breaking tickets', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-legacy-'));
+  const databasePath = path.join(directory, 'legacy.sqlite');
+  const legacy = new Database(databasePath);
+  try {
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        interaction_id TEXT NOT NULL UNIQUE,
+        guild_id TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        product_key TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        price_cents INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN (
+          'pending_approval', 'ticket_creating', 'awaiting_payment',
+          'proof_submitted', 'paid', 'rejected', 'closed_unpaid'
+        )),
+        staff_message_id TEXT UNIQUE,
+        ticket_channel_id TEXT UNIQUE,
+        ticket_channel_name TEXT,
+        ticket_creation_started_at INTEGER,
+        payment_currency TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        interaction_id TEXT NOT NULL UNIQUE,
+        guild_id TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        order_id INTEGER UNIQUE REFERENCES orders(id),
+        channel_id TEXT UNIQUE,
+        channel_name TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        closed_at INTEGER
+      );
+    `);
+    legacy.prepare(`
+      INSERT INTO orders (
+        interaction_id, guild_id, customer_id, product_key, product_name, price_cents,
+        status, ticket_channel_id, ticket_channel_name, created_at, updated_at
+      ) VALUES (?, 'guild-1', ?, 'minecraft', 'Minecraft', 1300, ?, ?, ?, ?, ?)
+    `).run('old-open-order', 'customer-1', 'proof_submitted', 'channel-open', 'purchase-1', Date.now(), Date.now());
+    legacy.prepare(`
+      INSERT INTO orders (
+        interaction_id, guild_id, customer_id, product_key, product_name, price_cents,
+        status, ticket_channel_id, ticket_channel_name, created_at, updated_at
+      ) VALUES (?, 'guild-1', ?, 'minecraft', 'Minecraft', 1300, ?, ?, ?, ?, ?)
+    `).run('old-closed-order', 'customer-2', 'closed_unpaid', 'channel-closed', 'purchase-2', Date.now(), Date.now());
+    legacy.prepare(`
+      INSERT INTO tickets (
+        interaction_id, guild_id, customer_id, kind, order_id, channel_id,
+        channel_name, status, created_at
+      ) VALUES ('old-ticket-open', 'guild-1', 'customer-1', 'purchase', 1,
+        'channel-open', 'purchase-1', 'open', ?)
+    `).run(Date.now());
+    legacy.prepare(`
+      INSERT INTO tickets (
+        interaction_id, guild_id, customer_id, kind, order_id, channel_id,
+        channel_name, status, created_at, closed_at
+      ) VALUES ('old-ticket-closed', 'guild-1', 'customer-2', 'purchase', 2,
+        'channel-closed', 'purchase-2', 'closed', ?, ?)
+    `).run(Date.now(), Date.now());
+  } finally {
+    legacy.close();
+  }
+
+  try {
+    const db = createDatabase(databasePath);
+    try {
+      assert.equal(db.prepare('SELECT status FROM orders WHERE id = 1').get().status, 'open');
+      assert.equal(db.prepare('SELECT status FROM orders WHERE id = 2').get().status, 'closed');
+      assert.deepEqual(db.pragma('foreign_key_check'), []);
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tickets').get().count, 2);
+    } finally {
+      db.close();
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
