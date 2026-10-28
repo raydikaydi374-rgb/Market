@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-20", "web", "bash"]
 
 [deployment]
 router = "application"
@@ -27,3 +27,6 @@ GUILD_ID = "1564357450771988503"
 STAFF_ROLE_ID = "1564358072120512713"
 ORDERS_CHANNEL_ID = "1564750524639744160"
 TICKET_CATEGORY_ID = "1564918984778846268"
+
+[nix]
+channel = "stable-25_05"
