@@ -1423,6 +1423,15 @@ async function validateGuildSetup(client, config, db) {
   if (!botMember.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
     throw new Error('يحتاج البوت إلى صلاحية Manage Channels لإنشاء قنوات التكتات الخاصة.');
   }
+  const ticketRoleIds = getTicketRoleIds(db, guild.id);
+  for (const roleId of ticketRoleIds) {
+    const role = await guild.roles.fetch(roleId).catch(() => null);
+    if (!role) {
+      console.error(`رتبة التكتات ${roleId} غير موجودة في السيرفر.`);
+    } else if (role.comparePositionTo(botMember.roles.highest) >= 0) {
+      console.error(`رتبة البوت يجب أن تكون أعلى من رتبة التكتات ${role.name} لضبط أذونات القنوات الخاصة.`);
+    }
+  }
   if (!database.getSetting(db, guild.id, 'owner_id')) {
     console.warn('لم يتم تعيين الأونر بعد؛ عيّنه بأمر /setowner قبل استقبال طلبات المتجر.');
   }
@@ -1431,6 +1440,22 @@ async function validateGuildSetup(client, config, db) {
     const channel = await guild.channels.fetch(channelId).catch(() => null);
     if (!channel || channel.type !== ChannelType.GuildText || channel.guildId !== guild.id) {
       console.error('قناة الطلبات غير صالحة؛ استخدم /setorderschannel بعد تشغيل البوت.');
+    } else {
+      const requiredPermissions = [
+        ['View Channel', PermissionsBitField.Flags.ViewChannel],
+        ['Send Messages', PermissionsBitField.Flags.SendMessages],
+        ['Read Message History', PermissionsBitField.Flags.ReadMessageHistory],
+        ['Embed Links', PermissionsBitField.Flags.EmbedLinks],
+      ];
+      const permissions = channel.permissionsFor(botMember);
+      const missing = requiredPermissions
+        .filter(([, permission]) => !permissions?.has(permission))
+        .map(([name]) => name);
+      if (missing.length) {
+        console.error(`صلاحيات البوت ناقصة في قناة الطلبات ${channel.name}: ${missing.join(', ')}.`);
+      } else {
+        console.info(`صلاحيات البوت في قناة الطلبات ${channel.name} مكتملة.`);
+      }
     }
   } else {
     console.warn('لم تُحدد قناة الطلبات بعد؛ استخدم /setorderschannel داخل Discord.');
