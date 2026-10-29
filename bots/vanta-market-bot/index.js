@@ -1429,7 +1429,7 @@ async function validateGuildSetup(client, config, db) {
     if (!role) {
       console.error(`رتبة التكتات ${roleId} غير موجودة في السيرفر.`);
     } else if (role.comparePositionTo(botMember.roles.highest) >= 0) {
-      console.error(`رتبة البوت يجب أن تكون أعلى من رتبة التكتات ${role.name} لضبط أذونات القنوات الخاصة.`);
+      console.error(`رتبة البوت ${botMember.roles.highest.name} أدنى من رتبة التكتات ${role.name}؛ ارفع رتبة البوت فوقها لضبط أذونات القنوات الخاصة.`);
     }
   }
   if (!database.getSetting(db, guild.id, 'owner_id')) {
