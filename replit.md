@@ -1,45 +1,51 @@
-# [Project name]
+# Vanta Market Discord Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Arabic Discord shop and private-ticket bot. Its product catalog, role permissions, channel settings, and order lifecycle are managed with Discord slash commands and stored in SQLite.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `pnpm --filter @workspace/vanta-market-bot run check` — syntax-check the bot and database modules
+- `pnpm --filter @workspace/vanta-market-bot test` — run the bot's SQLite and permission tests
+- `pnpm --filter @workspace/vanta-market-bot start` — start the Discord bot
+- Required secret: `DISCORD_TOKEN`
+- Required shared environment: `CLIENT_ID`, `GUILD_ID`
+- Optional initial settings: `STAFF_ROLE_ID`, `ORDERS_CHANNEL_ID`, `TICKET_CATEGORY_ID`, `ORDER_NOTIFY_USER_ID`, `DATABASE_PATH`
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- pnpm workspace monorepo, Node.js 20+
+- Bot: CommonJS, discord.js v14
+- Bot data: SQLite through better-sqlite3
+- The bot does not serve HTTP; its runtime is separate from the API and mockup artifacts.
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `bots/vanta-market-bot/index.js` — Discord commands, interactions, private channel permissions, and startup registration.
+- `bots/vanta-market-bot/database.js` — SQLite schema, legacy migration, product settings, tickets, orders, and status transitions.
+- `bots/vanta-market-bot/test/bot.test.js` — automated database, migration, order-state, and permission-overwrite tests.
+- `bots/vanta-market-bot/README.md` — setup, commands, and Discord permission limitations.
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Keep one bot process per SQLite database; order/ticket records are durable and are not removed when a Discord channel is deleted.
+- Payment is confirmed manually by authorized staff; accepting an order never marks it paid.
+- Ticket channels deny `ViewChannel` to `@everyone`; Discord's server-wide `Administrator` permission bypasses channel overwrites.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Customers select a product, quantity, and LTC, then type an Arabic confirmation to submit a persistent order. Authorized users review it, create a private discussion ticket, coordinate payment, and manually record payment and completion.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+Preserve the existing Vanta Market bot and its data. Do not replace it with a new bot. Bot settings are administered through protected slash commands; operational staff roles can process orders but cannot change bot settings.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Put `DISCORD_TOKEN` in Replit Secrets, never in source or `.env.example`.
+- Enable Discord Message Content Intent for typed customer confirmation.
+- The bot needs Manage Channels, channel access to Orders and the ticket category, and a higher role than configured admin roles.
+- Test with `pnpm --filter @workspace/vanta-market-bot run check && pnpm --filter @workspace/vanta-market-bot test`.
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Bot setup details and `/cmd` command inventory are in `bots/vanta-market-bot/README.md`.

@@ -12,6 +12,7 @@ const {
   COMPONENT_IDS,
   createDatabase,
   hasAdminAccess,
+  hasStaffAccess,
   storeComponents,
   ticketOverwrites,
 } = require('../index');
@@ -79,6 +80,12 @@ test('product buttons are arranged within Discord row limits and Support is abse
     assert.ok(rows.every((row) => row.components.length <= 5));
     assert.equal(COMMANDS.some((command) => command.name === 'store'), true);
     assert.equal(COMMANDS.some((command) => command.name === 'cmd'), true);
+    for (const name of [
+      'setowner', 'removeowner', 'addadminrole', 'removeadminrole', 'listadminroles',
+      'addstaffrole', 'removestaffrole', 'liststaffroles', 'setorderschannel',
+      'setticketcategory', 'setpaymentwallet', 'setmentionuser', 'setbuttonname',
+      'setticketname', 'addproductbutton', 'removeproductbutton', 'editproduct',
+    ]) assert.ok(COMMANDS.some((command) => command.name === name), `missing /${name}`);
   } finally {
     db.close();
   }
@@ -203,6 +210,7 @@ test('ticket access includes only the customer, configured owner/admin roles, an
     Database.initializeGuildData(db, { guildId: 'guild-1' });
     Database.setSetting(db, 'guild-1', 'owner_id', 'owner-user');
     db.prepare("INSERT INTO admin_roles (guild_id, role_id, added_by, created_at) VALUES ('guild-1', 'role-admin', 'owner-user', 1)").run();
+    db.prepare("INSERT INTO staff_roles (guild_id, role_id, added_by, created_at) VALUES ('guild-1', 'role-staff', 'owner-user', 1)").run();
     const result = ticketOverwrites({
       id: 'guild-1',
       roles: { everyone: { id: 'guild-1' } },
@@ -213,10 +221,13 @@ test('ticket access includes only the customer, configured owner/admin roles, an
       'customer-1',
       'owner-user',
       'role-admin',
+      'role-staff',
       'bot-user',
     ]);
+    assert.equal(result.some((overwrite) => overwrite.id === 'role-other'), false);
     assert.equal(result[0].deny.includes(PermissionsBitField.Flags.ViewChannel), true);
     assert.equal(result[1].deny.includes(PermissionsBitField.Flags.ManageChannels), true);
+    assert.equal(result[1].deny.includes(PermissionsBitField.Flags.CreateInstantInvite), true);
     assert.equal(result.at(-1).allow.includes(PermissionsBitField.Flags.ManageChannels), true);
   } finally {
     db.close();
@@ -225,10 +236,13 @@ test('ticket access includes only the customer, configured owner/admin roles, an
 
 test('role and owner authorization requires an already-authorized user', () => {
   const roleMember = { id: 'member-1', roles: { cache: { has: (id) => id === 'role-admin', some: (check) => check('role-admin') } } };
+  const staffMember = { id: 'member-staff', roles: { cache: { has: (id) => id === 'role-staff', some: (check) => check('role-staff') } } };
   const ordinaryMember = { id: 'member-2', roles: { cache: { has: (id) => id === 'role-other', some: (check) => check('role-other') } } };
   assert.equal(hasAdminAccess(roleMember, 'owner-1', ['role-admin']), true);
   assert.equal(hasAdminAccess({ id: 'owner-1', roles: { cache: { some: () => false } } }, 'owner-1', []), true);
   assert.equal(hasAdminAccess(ordinaryMember, 'owner-1', ['role-admin']), false);
+  assert.equal(hasAdminAccess(staffMember, 'owner-1', ['role-admin']), false);
+  assert.equal(hasStaffAccess(staffMember, 'owner-1', ['role-admin'], ['role-staff']), true);
 });
 
 test('legacy SQLite orders, tickets, and custom buttons migrate without dropping customer data', () => {
@@ -317,6 +331,72 @@ test('legacy SQLite orders, tickets, and custom buttons migrate without dropping
       db.close();
     }
   } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('SQLite order, owner, roles, and ticket data survive database reopen', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'vanta-persistence-'));
+  const databasePath = path.join(directory, 'vanta.sqlite');
+  let db;
+  try {
+    db = createDatabase(databasePath);
+    Database.initializeGuildData(db, {
+      guildId: 'guild-1',
+      ordersChannelId: 'orders-channel',
+      ticketCategoryId: 'ticket-category',
+      orderNotifyUserId: 'notify-user',
+    });
+    Database.setSetting(db, 'guild-1', 'owner_id', 'owner-user');
+    db.prepare(`
+      INSERT INTO admin_roles (guild_id, role_id, added_by, created_at)
+      VALUES ('guild-1', 'role-admin', 'owner-user', 1)
+    `).run();
+    db.prepare(`
+      INSERT INTO staff_roles (guild_id, role_id, added_by, created_at)
+      VALUES ('guild-1', 'role-staff', 'owner-user', 1)
+    `).run();
+    const product = Database.listProducts(db, 'guild-1')[0];
+    const created = Database.createOrder(db, {
+      interactionId: 'persistent-order',
+      guildId: 'guild-1',
+      customerId: 'customer-1',
+      product,
+      quantity: 3,
+    });
+    Database.saveInitialTicketChannel(db, created.ticket.id, 'initial-channel');
+    Database.selectPaymentMethod(db, {
+      orderId: created.order.id,
+      guildId: 'guild-1',
+      customerId: 'customer-1',
+      channelId: 'initial-channel',
+    });
+    Database.confirmOrder(db, {
+      orderId: created.order.id,
+      guildId: 'guild-1',
+      customerId: 'customer-1',
+      channelId: 'initial-channel',
+    });
+    db.close();
+    db = createDatabase(databasePath);
+    const order = db.prepare('SELECT * FROM orders WHERE interaction_id = ?').get('persistent-order');
+    assert.equal(order.quantity, 3);
+    assert.equal(order.price_cents, product.price_cents * 3);
+    assert.equal(order.payment_method, 'LTC');
+    assert.equal(order.customer_confirmed, 1);
+    assert.equal(order.status, 'Pending');
+    assert.equal(db.prepare('SELECT channel_id FROM tickets WHERE order_id = ? AND kind = ?')
+      .get(order.id, 'confirmation').channel_id, 'initial-channel');
+    assert.equal(Database.getSetting(db, 'guild-1', 'owner_id'), 'owner-user');
+    assert.deepEqual(db.prepare('SELECT role_id FROM admin_roles WHERE guild_id = ?').all('guild-1'), [
+      { role_id: 'role-admin' },
+    ]);
+    assert.deepEqual(db.prepare('SELECT role_id FROM staff_roles WHERE guild_id = ?').all('guild-1'), [
+      { role_id: 'role-staff' },
+    ]);
+    assert.equal(Database.getSetting(db, 'guild-1', 'mention_user_id'), 'notify-user');
+  } finally {
+    if (db?.open) db.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

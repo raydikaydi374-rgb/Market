@@ -11,6 +11,26 @@ env = { "CI" = "true" }
 [workflows]
 runButton = "Project"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Vanta Market Bot"
+
+[[workflows.workflow]]
+name = "Vanta Market Bot"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/vanta-market-bot start"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true
@@ -27,6 +47,7 @@ GUILD_ID = "1564357450771988503"
 STAFF_ROLE_ID = "1564358072120512713"
 ORDERS_CHANNEL_ID = "1564750524639744160"
 TICKET_CATEGORY_ID = "1564918984778846268"
+ORDER_NOTIFY_USER_ID = "903466342030639215"
 
 [nix]
 channel = "stable-25_05"

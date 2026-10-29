@@ -68,14 +68,15 @@ const COMMANDS = [
   { name: 'listadminroles', description: 'عرض رتب الأدمن الحالية', summary: 'عرض الرتب المخولة حاليًا.', access: 'admin' },
   {
     name: 'addstaffrole', description: 'إضافة رتبة ستاف مخولة بإدارة الطلبات',
-    summary: 'اسم بديل لإضافة رتبة أدمن.', access: 'admin',
+    summary: 'إضافة رتبة تشغيلية للموافقة والدفع دون تعديل إعدادات البوت.', access: 'admin',
     options: [{ type: 8, name: 'role', description: 'رتبة الستاف المخولة', required: true }],
   },
   {
     name: 'removestaffrole', description: 'إزالة رتبة ستاف من الصلاحيات',
-    summary: 'اسم بديل لإزالة رتبة أدمن.', access: 'admin',
+    summary: 'إزالة صلاحية إدارة الطلبات من رتبة ستاف.', access: 'admin',
     options: [{ type: 8, name: 'role', description: 'رتبة الستاف المراد إزالتها', required: true }],
   },
+  { name: 'liststaffroles', description: 'عرض رتب الستاف التشغيلية', summary: 'عرض الرتب المسموح لها بإدارة الطلبات دون إعدادات البوت.', access: 'admin' },
   {
     name: 'setorderschannel', description: 'تحديد قناة استقبال طلبات المتجر',
     summary: 'تحديد قناة نشر الطلبات وأزرار مراجعتها.', access: 'admin',
@@ -215,8 +216,31 @@ function getAdminRoleIds(db, guildId) {
     .all(guildId).map((row) => row.role_id);
 }
 
+function getTicketRoleIds(db, guildId) {
+  return [...new Set([
+    ...getAdminRoleIds(db, guildId),
+    ...database.getStaffRoleIds(db, guildId),
+  ])];
+}
+
 function isAuthorized(db, guildId, member) {
   return hasAdminAccess(member, database.getSetting(db, guildId, 'owner_id'), getAdminRoleIds(db, guildId));
+}
+
+function hasStaffAccess(member, ownerId, adminRoleIds, staffRoleIds) {
+  return hasAdminAccess(member, ownerId, [
+    ...adminRoleIds,
+    ...staffRoleIds,
+  ]);
+}
+
+function isStaffAuthorized(db, guildId, member) {
+  return hasStaffAccess(
+    member,
+    database.getSetting(db, guildId, 'owner_id'),
+    getAdminRoleIds(db, guildId),
+    database.getStaffRoleIds(db, guildId),
+  );
 }
 
 function isBootstrapAdmin(member) {
@@ -231,7 +255,7 @@ function ticketOverwrites(guild, ticket, db) {
     PermissionsBitField.Flags.AttachFiles,
     PermissionsBitField.Flags.EmbedLinks,
   ];
-  const adminRoleIds = getAdminRoleIds(db, guild.id);
+  const adminRoleIds = getTicketRoleIds(db, guild.id);
   const overwrites = [{
     id: guild.roles.everyone.id,
     deny: [PermissionsBitField.Flags.ViewChannel],
@@ -278,7 +302,7 @@ function storeEmbed(products) {
     .setTitle('Vanta Market | المتجر')
     .setDescription(products.length
       ? products.map((product) =>
-        `**${product.product_name}** — ${money(product.price_cents)} · التكت: ${product.ticket_name} · \`P${product.id}\``,
+        `**${product.product_name.slice(0, 48)}** — ${money(product.price_cents)} · التكت: ${product.ticket_name.slice(0, 32)} · \`P${product.id}\``,
       ).join('\n')
       : 'لا توجد منتجات متاحة حاليًا.')
     .setThumbnail('attachment://vanta-market-logo.png')
@@ -292,7 +316,7 @@ function storeComponents(products) {
     for (const product of products.slice(offset, offset + 5)) {
       row.addComponents(new ButtonBuilder()
         .setCustomId(`product:${product.id}`)
-        .setLabel(`${product.button_label} · ${money(product.price_cents)}`.slice(0, 80))
+        .setLabel(`${product.button_label.slice(0, 55).trim()} · ${money(product.price_cents)}`)
         .setStyle(ButtonStyle.Primary));
     }
     rows.push(row);
@@ -318,7 +342,7 @@ function ticketDeleteRow() {
 
 function initialTicketComponents(order) {
   const rows = [];
-  if (!order.payment_method) {
+  if (order.status === 'Pending' && !order.payment_method) {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`payment:ltc:${order.id}`)
         .setLabel('الدفع عبر LTC').setStyle(ButtonStyle.Success),
@@ -407,7 +431,7 @@ function getMentions(db, guildId, customerId, includeRoles = false) {
   if (mentionUserId) users.add(mentionUserId);
   return {
     users: [...users],
-    roles: includeRoles ? getAdminRoleIds(db, guildId) : [],
+    roles: includeRoles ? getTicketRoleIds(db, guildId) : [],
   };
 }
 
@@ -450,7 +474,7 @@ async function upgradeLegacyStorePanels(db, guild) {
       PermissionsBitField.Flags.ViewChannel,
       PermissionsBitField.Flags.ReadMessageHistory,
     ])) continue;
-    const messages = await channel.messages.fetch({ limit: 25 }).catch(() => null);
+    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
     if (!messages) continue;
     for (const message of messages.values()) {
       if (message.author.id !== guild.client.user.id) continue;
@@ -472,7 +496,7 @@ async function upgradeLegacyStorePanels(db, guild) {
 }
 
 async function ensureTicketPrompt(db, ticket, guild) {
-  if (!ticket.channel_id || !['open', 'closing'].includes(ticket.status)) return;
+  if (!ticket.channel_id || !['open', 'closing', 'closed'].includes(ticket.status)) return;
   const channel = await guild.channels.fetch(ticket.channel_id).catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildText) return;
   const order = ticket.order_id ? db.prepare('SELECT * FROM orders WHERE id = ?').get(ticket.order_id) : null;
@@ -506,7 +530,7 @@ async function notifyAdmins(db, guild, message) {
   const channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
   const mentions = {
     users: [database.getSetting(db, guild.id, 'owner_id')].filter(Boolean),
-    roles: getAdminRoleIds(db, guild.id),
+    roles: getTicketRoleIds(db, guild.id),
   };
   if (channel?.isTextBased()) {
     await channel.send({
@@ -555,7 +579,7 @@ async function createPrivateTicketChannel(db, guild, ticket, order) {
   if (!botMember.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
     throw new Error('يحتاج البوت إلى صلاحية Manage Channels لإنشاء التكتات الخاصة.');
   }
-  const roles = getAdminRoleIds(db, guild.id);
+  const roles = getTicketRoleIds(db, guild.id);
   for (const roleId of roles) {
     const role = await guild.roles.fetch(roleId).catch(() => null);
     if (!role) throw new Error(`رتبة الأدمن ${roleId} غير موجودة.`);
@@ -574,6 +598,10 @@ async function createPrivateTicketChannel(db, guild, ticket, order) {
 }
 
 async function createOrderTicket(db, interaction, product, quantity, guild) {
+  if (!database.getSetting(db, guild.id, 'owner_id')) {
+    await interaction.editReply('يجب أن يعيّن الأونر نفسه أولًا باستخدام /setowner قبل استقبال الطلبات.');
+    return;
+  }
   const created = database.createOrder(db, {
     interactionId: interaction.id,
     guildId: guild.id,
@@ -719,12 +747,53 @@ async function deleteInitialTicket(db, orderId, guild, replacementChannelId) {
       const notice = replacementChannelId
         ? `تم تجهيز تذكرة المناقشة: <#${replacementChannelId}>. لا ترسل معلومات جديدة هنا.`
         : 'تم اتخاذ قرار نهائي بشأن هذا الطلب. لا ترسل معلومات جديدة هنا.';
+      await channel.permissionOverwrites.edit(ticket.customer_id, {
+        ViewChannel: true,
+        SendMessages: false,
+        AttachFiles: false,
+        CreatePrivateThreads: false,
+        CreatePublicThreads: false,
+      }).catch((permissionError) => {
+        console.error(`تعذر جعل التذكرة القديمة للقراءة فقط ${orderId}:`, permissionError.message);
+      });
       await channel.send(notice).catch(() => {});
+      database.closeTicketRecord(db, ticket.id);
+      await notifyAdmins(db, guild, `تعذر حذف القناة القديمة للطلب ${orderId}؛ جُعلت للقراءة فقط.`);
       return false;
     }
   }
   database.closeTicketRecord(db, ticket.id);
   return true;
+}
+
+async function archiveInitialTicket(db, ticket, guild, reason) {
+  if (!ticket) return false;
+  if (!ticket.channel_id) {
+    database.closeTicketRecord(db, ticket.id);
+    return true;
+  }
+  const channel = await guild.channels.fetch(ticket.channel_id).catch(() => null);
+  if (!channel) {
+    database.closeTicketRecord(db, ticket.id);
+    return true;
+  }
+  try {
+    await channel.permissionOverwrites.set(
+      ticketOverwrites(guild, { ...ticket, status: 'closed' }, db),
+      reason,
+    );
+    db.prepare("UPDATE tickets SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'open'")
+      .run(Date.now(), ticket.id);
+    const closedTicket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticket.id);
+    await ensureTicketPrompt(db, closedTicket, guild).catch((error) => {
+      console.error(`تعذر تحديث واجهة التذكرة المؤرشفة ${ticket.id}:`, error.message);
+    });
+    return true;
+  } catch (error) {
+    console.error(`تعذر أرشفة تكت الطلب ${ticket.order_id}:`, error.message);
+    await notifyAdmins(db, guild, `تعذر جعل تكت الطلب ${ticket.order_id} للقراءة فقط؛ تحقق من صلاحيات البوت.`);
+    return false;
+  }
 }
 
 async function acceptOrder(db, interaction, orderId, guild) {
@@ -841,7 +910,7 @@ async function handleTicketConfirmation(db, message) {
     const updatedOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
     await disableOrderMessage(db, updatedOrder, message.guild).catch(() => {});
     await message.channel.send('تم إلغاء الطلب. سيبقى سجله محفوظًا في قاعدة البيانات.').catch(() => {});
-    await deleteInitialTicket(db, order.id, message.guild, null);
+    await archiveInitialTicket(db, ticket, message.guild, 'Customer cancelled the pending order');
     return;
   }
 
@@ -861,8 +930,10 @@ async function handleTicketConfirmation(db, message) {
     return;
   }
   try {
-    await findOrPostOrderMessage(db, confirmed, message.guild);
-    await message.channel.send(`تم إرسال ${formatOrderCode(confirmed)} إلى الإدارة للمراجعة. لم يتم تسجيل الدفع.`)
+    const announced = await findOrPostOrderMessage(db, confirmed, message.guild);
+    await message.channel.send(announced
+      ? `تم إرسال ${formatOrderCode(confirmed)} إلى الإدارة للمراجعة. لم يتم تسجيل الدفع.`
+      : `تم حفظ ${formatOrderCode(confirmed)} ويجري تنبيه الإدارة به. لم يتم تسجيل الدفع.`)
       .catch(() => {});
   } catch (error) {
     console.error(`تعذر إرسال ${formatOrderCode(confirmed)} بعد التأكيد:`, error.message);
@@ -874,7 +945,8 @@ async function handleTicketConfirmation(db, message) {
 async function requireAdmin(interaction, db, { allowBootstrap = true } = {}) {
   const authorized = isAuthorized(db, interaction.guildId, interaction.member);
   const noConfiguredAuthority = !database.getSetting(db, interaction.guildId, 'owner_id') &&
-    getAdminRoleIds(db, interaction.guildId).length === 0;
+    getAdminRoleIds(db, interaction.guildId).length === 0 &&
+    database.getStaffRoleIds(db, interaction.guildId).length === 0;
   if (authorized || (allowBootstrap && noConfiguredAuthority && isBootstrapAdmin(interaction.member))) return true;
   await interaction.reply({
     content: 'هذا الأمر متاح للأونر أو لأعضاء رتب الأدمن المحددة فقط.',
@@ -884,8 +956,8 @@ async function requireAdmin(interaction, db, { allowBootstrap = true } = {}) {
 }
 
 async function requireStaff(interaction, db) {
-  if (isAuthorized(db, interaction.guildId, interaction.member)) return true;
-  await sendEphemeral(interaction, 'هذا الإجراء متاح للأونر ورتب الأدمن المخولة فقط.');
+  if (isStaffAuthorized(db, interaction.guildId, interaction.member)) return true;
+  await sendEphemeral(interaction, 'هذا الإجراء متاح للأونر ورتب الأدمن أو الستاف المخولة فقط.');
   return false;
 }
 
@@ -897,7 +969,7 @@ async function sendEphemeral(interaction, content) {
 function commandHelp() {
   const accessLabels = {
     admin: 'إداري · الأونر أو رتب الأدمن',
-    staff: 'ستاف · الأونر أو رتب الأدمن',
+    staff: 'ستاف · الأونر أو رتب الأدمن/الستاف',
     public: 'عام',
   };
   const fields = COMMANDS.map((command) => ({
@@ -949,7 +1021,8 @@ async function ensureRoleManageable(interaction, role) {
 async function changeAdminRole(db, interaction, role, shouldAdd) {
   if (shouldAdd && !(await ensureRoleManageable(interaction, role))) return;
   if (shouldAdd) {
-    if (getAdminRoleIds(db, interaction.guildId).length >= 96) {
+    if (getTicketRoleIds(db, interaction.guildId).length >= 96 &&
+        !getTicketRoleIds(db, interaction.guildId).includes(role.id)) {
       return sendEphemeral(interaction, 'وصلت إلى الحد الأقصى لرتب الأدمن التي يمكن إضافتها إلى صلاحيات التكتات.');
     }
     const result = db.prepare(`
@@ -978,6 +1051,32 @@ async function changeAdminRole(db, interaction, role, shouldAdd) {
     shouldAdd
       ? `تمت إضافة ${role} إلى رتب الأدمن وتحديث التكتات.${failures.length ? ` تعذر تحديث ${failures.length} تكت؛ أُبلغت الإدارة.` : ''}`
       : `تمت إزالة ${role} من رتب الأدمن وتحديث التكتات.${failures.length ? ` تعذر تحديث ${failures.length} تكت؛ أُبلغت الإدارة.` : ''}`,
+  );
+}
+
+async function changeStaffRole(db, interaction, role, shouldAdd) {
+  if (shouldAdd && !(await ensureRoleManageable(interaction, role))) return;
+  if (shouldAdd) {
+    if (getTicketRoleIds(db, interaction.guildId).length >= 96 &&
+        !getTicketRoleIds(db, interaction.guildId).includes(role.id)) {
+      return sendEphemeral(interaction, 'وصلت إلى الحد الأقصى لرتب الستاف التي يمكن إضافتها إلى التكتات.');
+    }
+    const result = db.prepare(`
+      INSERT OR IGNORE INTO staff_roles (guild_id, role_id, added_by, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(interaction.guildId, role.id, interaction.user.id, Date.now());
+    if (!result.changes) return sendEphemeral(interaction, 'هذه الرتبة موجودة بالفعل ضمن رتب الستاف.');
+  } else {
+    const result = db.prepare('DELETE FROM staff_roles WHERE guild_id = ? AND role_id = ?')
+      .run(interaction.guildId, role.id);
+    if (!result.changes) return sendEphemeral(interaction, 'هذه الرتبة غير موجودة ضمن رتب الستاف.');
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const failures = await syncTicketPermissions(db, interaction.guild);
+  await interaction.editReply(
+    shouldAdd
+      ? `تمت إضافة ${role} كرتبة ستاف. لا تمنح صلاحية تعديل إعدادات البوت.${failures.length ? ` تعذر تحديث ${failures.length} تكت؛ أُبلغت الإدارة.` : ''}`
+      : `تمت إزالة ${role} من رتب الستاف وتحديث التكتات.${failures.length ? ` تعذر تحديث ${failures.length} تكت؛ أُبلغت الإدارة.` : ''}`,
   );
 }
 
@@ -1019,7 +1118,7 @@ async function handleConfigCommand(db, interaction) {
     const paid = database.markOrderPaid(db, ticket.order_id, interaction.guildId, interaction.user.id);
     if (!paid) return sendEphemeral(interaction, 'تعذر التأكيد: يجب أن تكون حالة الطلب Payment Pending.');
     await interaction.channel.send(`أكد الستاف <@${interaction.user.id}> استلام الدفع للطلب **${formatOrderCode(paid)}** يدويًا. لا تُستخدم الصور وحدها كدليل.`);
-    await interaction.message?.edit?.({ components: discussionComponents(paid) }).catch(() => {});
+    await ensureTicketPrompt(db, ticket, interaction.guild);
     return sendEphemeral(interaction, 'تم تسجيل الدفع يدويًا. يمكنك إكمال الطلب بعد تسليمه.');
   }
 
@@ -1030,6 +1129,7 @@ async function handleConfigCommand(db, interaction) {
     const completed = database.completeOrder(db, ticket.order_id, interaction.guildId, interaction.user.id);
     if (!completed) return sendEphemeral(interaction, 'يجب تأكيد الدفع يدويًا قبل إكمال الطلب.');
     await interaction.channel.send(`تم تسجيل ${formatOrderCode(completed)} كمكتمل بواسطة <@${interaction.user.id}>.`);
+    await ensureTicketPrompt(db, ticket, interaction.guild);
     return sendEphemeral(interaction, 'تم إكمال الطلب وحفظ سجل الحالة.');
   }
 
@@ -1053,12 +1153,21 @@ async function handleConfigCommand(db, interaction) {
     return;
   }
 
-  if (['addadminrole', 'addstaffrole', 'removeadminrole', 'removestaffrole'].includes(name)) {
+  if (['addadminrole', 'removeadminrole'].includes(name)) {
     return changeAdminRole(
       db,
       interaction,
       interaction.options.getRole('role', true),
-      name === 'addadminrole' || name === 'addstaffrole',
+      name === 'addadminrole',
+    );
+  }
+
+  if (['addstaffrole', 'removestaffrole'].includes(name)) {
+    return changeStaffRole(
+      db,
+      interaction,
+      interaction.options.getRole('role', true),
+      name === 'addstaffrole',
     );
   }
 
@@ -1069,6 +1178,17 @@ async function handleConfigCommand(db, interaction) {
       return role ? `${role} (\`${role.id}\`)` : `رتبة غير موجودة (\`${id}\`)`;
     }));
     return sendEphemeral(interaction, display.length ? `**رتب الأدمن:**\n${display.join('\n')}` : 'لا توجد رتب أدمن مضبوطة.');
+  }
+
+  if (name === 'liststaffroles') {
+    const roleIds = database.getStaffRoleIds(db, interaction.guildId);
+    const display = await Promise.all(roleIds.map(async (id) => {
+      const role = await interaction.guild.roles.fetch(id).catch(() => null);
+      return role ? `${role} (\`${role.id}\`)` : `رتبة غير موجودة (\`${id}\`)`;
+    }));
+    return sendEphemeral(interaction, display.length
+      ? `**رتب الستاف التشغيلية:**\n${display.join('\n')}`
+      : 'لا توجد رتب ستاف تشغيلية مضبوطة.');
   }
 
   if (name === 'setorderschannel' || name === 'setticketcategory') {
@@ -1138,11 +1258,15 @@ async function handleConfigCommand(db, interaction) {
     await refreshStorePanels(db, interaction.guild, interaction.guildId);
     if (name === 'custom_button') {
       const logoPath = path.join(__dirname, 'assets', 'vanta-market-logo.png');
-      await interaction.channel.send({
+      const panel = await interaction.channel.send({
         embeds: [storeEmbed([product])],
         components: storeComponents([product]),
         files: fs.existsSync(logoPath) ? [new AttachmentBuilder(logoPath)] : [],
       });
+      db.prepare(`
+        INSERT OR IGNORE INTO store_panels (guild_id, channel_id, message_id, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(interaction.guildId, interaction.channelId, panel.id, Date.now());
     }
     return sendEphemeral(interaction, `تمت إضافة المنتج **${product.product_name}** برقم \`P${product.id}\` إلى لوحة المتجر.`);
   }
@@ -1202,7 +1326,8 @@ async function handleTicketDelete(db, interaction) {
     }
     await interaction.editReply('تم حذف القناة. بقي سجل التذكرة والطلب محفوظًا.');
   } catch (error) {
-    db.prepare("UPDATE tickets SET status = 'open' WHERE id = ? AND status = 'closing'").run(ticket.id);
+    db.prepare("UPDATE tickets SET status = ? WHERE id = ? AND status = 'closing'")
+      .run(ticket.status, ticket.id);
     throw error;
   }
 }
@@ -1217,7 +1342,8 @@ async function handleTicketFinish(db, interaction) {
   await channel.permissionOverwrites.set(ticketOverwrites(interaction.guild, closed, db), 'Close Vanta Market ticket');
   db.prepare("UPDATE tickets SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'open'")
     .run(Date.now(), ticket.id);
-  await channel.send('تم إغلاق التذكرة للعميل. سجل الطلب محفوظ؛ ويمكن للإدارة حذف القناة لاحقًا.', {
+  await channel.send({
+    content: 'تم إغلاق التذكرة للعميل. سجل الطلب محفوظ؛ ويمكن للإدارة حذف القناة لاحقًا.',
     components: [ticketDeleteRow()],
   });
   await interaction.editReply('تم إغلاق التذكرة مع الاحتفاظ بسجل الطلب.');
@@ -1283,7 +1409,7 @@ async function handleRejectionModal(db, interaction, orderId) {
     }).catch(() => {});
   }
   await interaction.editReply(`تم رفض ${formatOrderCode(rejected)} وحفظ اسم الرافض${reason ? ' وسبب الرفض' : ''}.`);
-  await deleteInitialTicket(db, orderId, interaction.guild, null);
+  await archiveInitialTicket(db, ticket, interaction.guild, 'Order rejected; preserve the reason for the customer');
 }
 
 async function validateGuildSetup(client, config, db) {
@@ -1296,6 +1422,9 @@ async function validateGuildSetup(client, config, db) {
   const botMember = await guild.members.fetchMe();
   if (!botMember.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
     throw new Error('يحتاج البوت إلى صلاحية Manage Channels لإنشاء قنوات التكتات الخاصة.');
+  }
+  if (!database.getSetting(db, guild.id, 'owner_id')) {
+    console.warn('لم يتم تعيين الأونر بعد؛ عيّنه بأمر /setowner قبل استقبال طلبات المتجر.');
   }
   const channelId = database.getSetting(db, guild.id, 'orders_channel_id');
   if (channelId) {
@@ -1350,6 +1479,11 @@ async function reconcileTickets(db, guild) {
     WHERE status = 'Accepted' AND discussion_channel_id IS NULL
       AND discussion_creation_started_at < ?
   `).run(Date.now() - TICKET_LEASE_MS);
+  db.prepare(`
+    UPDATE orders SET announcement_started_at = NULL
+    WHERE status = 'Pending' AND customer_confirmed = 1 AND staff_message_id IS NULL
+      AND announcement_started_at < ?
+  `).run(Date.now() - TICKET_LEASE_MS);
 }
 
 function createClient() {
@@ -1366,6 +1500,7 @@ async function start() {
   client.config = config;
   client.database = db;
   client.db = db;
+  let announcementRetryTimer = null;
 
   client.once(Events.ClientReady, async (readyClient) => {
     try {
@@ -1375,9 +1510,20 @@ async function start() {
         Routes.applicationGuildCommands(config.clientId, config.guildId),
         { body: COMMANDS.map(({ summary, access, ...command }) => command) },
       );
+      try {
+        await upgradeLegacyStorePanels(db, guild);
+      } catch (error) {
+        console.error('تعذر ترقية بعض لوحات المتجر القديمة:', error.message);
+      }
       await syncTicketPermissions(db, guild);
       await reconcileTickets(db, guild);
       await publishUnannouncedOrders(db, guild);
+      announcementRetryTimer = setInterval(() => {
+        publishUnannouncedOrders(db, guild).catch((error) => {
+          console.error('تعذرت إعادة محاولة إرسال الطلبات غير المعلنة:', error.message);
+        });
+      }, 60_000);
+      announcementRetryTimer.unref();
       console.info(`تم تسجيل الدخول كبوت Vanta Market في السيرفر ${guild.name}.`);
     } catch (error) {
       console.error('فشل إعداد بوت Vanta Market:', error.message);
@@ -1492,6 +1638,7 @@ async function start() {
 
   client.on(Events.Error, (error) => console.error('خطأ في اتصال Discord:', error.message));
   const stop = () => {
+    if (announcementRetryTimer) clearInterval(announcementRetryTimer);
     db.close();
     client.destroy();
     process.exit(0);
@@ -1514,6 +1661,7 @@ module.exports = {
   createClient,
   createDatabase: database.createDatabase,
   hasAdminAccess,
+  hasStaffAccess,
   loadConfig,
   orderEmbed,
   parsePositiveInteger,

@@ -330,6 +330,13 @@ function createDatabase(databasePath = process.env.DATABASE_PATH?.trim() || path
       created_at INTEGER NOT NULL,
       PRIMARY KEY (guild_id, role_id)
     );
+    CREATE TABLE IF NOT EXISTS staff_roles (
+      guild_id TEXT NOT NULL,
+      role_id TEXT NOT NULL,
+      added_by TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, role_id)
+    );
     CREATE TABLE IF NOT EXISTS store_panels (
       guild_id TEXT NOT NULL,
       channel_id TEXT NOT NULL,
@@ -444,6 +451,11 @@ function initializeGuildData(db, config) {
   `).all();
   const updateCode = db.prepare('UPDATE orders SET order_code = ? WHERE id = ?');
   for (const order of legacyOrders) updateCode.run(orderCode(order.id), order.id);
+}
+
+function getStaffRoleIds(db, guildId) {
+  return db.prepare('SELECT role_id FROM staff_roles WHERE guild_id = ? ORDER BY created_at, role_id')
+    .all(guildId).map((row) => row.role_id);
 }
 
 function listProducts(db, guildId, activeOnly = true) {
@@ -799,6 +811,7 @@ module.exports = {
   createDatabase,
   createInitialTicketReservation,
   createOrder,
+  getStaffRoleIds,
   getProduct,
   getSetting,
   getTicket,

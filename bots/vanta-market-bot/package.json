@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js",
+    "check": "node --check index.js && node --check database.js",
     "test": "node --test"
   },
   "dependencies": {
